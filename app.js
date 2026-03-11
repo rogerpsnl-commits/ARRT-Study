@@ -61,6 +61,13 @@ async function saveProfileToDB(key, data) {
   }
 }
 
+// --- PIN hashing ---
+async function hashPin(pin) {
+  const encoded = new TextEncoder().encode(pin);
+  const buffer = await crypto.subtle.digest('SHA-256', encoded);
+  return Array.from(new Uint8Array(buffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 function nameToKey(name) {
   return name.toLowerCase().replace(/\s+/g, '_');
 }
@@ -122,7 +129,14 @@ async function signIn() {
   const profile = profiles[key];
 
   if (!profile) { err.textContent = 'No account found. Create one below.'; return; }
-  if (profile.pin !== pin) { err.textContent = 'Incorrect PIN. Try again.'; return; }
+  const pinHash = await hashPin(pin);
+  // Support both hashed and legacy plain-text PINs
+  if (profile.pin !== pinHash && profile.pin !== pin) { err.textContent = 'Incorrect PIN. Try again.'; return; }
+  // Migrate legacy plain-text PIN to hashed
+  if (profile.pin === pin && profile.pin !== pinHash) {
+    profile.pin = pinHash;
+    await saveProfileToDB(key, profile);
+  }
 
   currentUser = key;
   localStorage.setItem(CURRENT_KEY, key);
@@ -148,8 +162,9 @@ async function createAccount() {
   if (profiles[key]) { err.textContent = 'That name is taken. Choose another.'; return; }
 
   const cats = ['Patient Care','Safety','Image Production','Procedures'];
+  const pinHash = await hashPin(pin);
   const newProfile = {
-    name, pin,
+    name, pin: pinHash,
     totalAnswered: 0, totalCorrect: 0, score: 0, bestStreak: 0,
     catStats: Object.fromEntries(cats.map(c => [c, { answered:0, correct:0 }])),
     savedAt: null

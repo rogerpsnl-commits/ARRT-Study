@@ -1,0 +1,21 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /profiles/{userId} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasAll(['name', 'pin', 'totalAnswered', 'totalCorrect', 'score', 'bestStreak', 'catStats'])
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0
+                    && request.resource.data.name.size() <= 30
+                    && request.resource.data.pin is string;
+      allow update: if request.resource.data.name == resource.data.name
+                    && request.resource.data.keys().hasAll(['name', 'pin', 'totalAnswered', 'totalCorrect', 'score', 'bestStreak', 'catStats']);
+      allow delete: if false;
+    }
+
+    // Block access to any other collection
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
