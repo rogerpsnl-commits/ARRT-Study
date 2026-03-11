@@ -24,37 +24,65 @@ const PROFILES_KEY = 'arrt_profiles';
 const CURRENT_KEY  = 'arrt_current';
 let currentUser = null;  // key into profiles
 
-function loadProfiles() {
+// --- Local cache helpers ---
+function loadProfilesLocal() {
   try { return JSON.parse(localStorage.getItem(PROFILES_KEY)) || {}; }
   catch { return {}; }
 }
 
-function saveProfiles(profiles) {
+function saveProfilesLocal(profiles) {
   localStorage.setItem(PROFILES_KEY, JSON.stringify(profiles));
+}
+
+// --- Firestore helpers ---
+async function loadProfilesFromDB() {
+  try {
+    const snapshot = await db.collection('profiles').get();
+    const profiles = {};
+    snapshot.forEach(doc => { profiles[doc.id] = doc.data(); });
+    saveProfilesLocal(profiles);  // cache locally
+    return profiles;
+  } catch (e) {
+    console.warn('Firestore read failed, using local cache:', e);
+    return loadProfilesLocal();
+  }
+}
+
+async function saveProfileToDB(key, data) {
+  // Always save locally first (fast)
+  const profiles = loadProfilesLocal();
+  profiles[key] = data;
+  saveProfilesLocal(profiles);
+  // Then sync to Firestore
+  try {
+    await db.collection('profiles').doc(key).set(data);
+  } catch (e) {
+    console.warn('Firestore write failed:', e);
+  }
 }
 
 function nameToKey(name) {
   return name.toLowerCase().replace(/\s+/g, '_');
 }
 
-function showAuthModal() {
-  const profiles = loadProfiles();
+async function showAuthModal() {
+  const profiles = await loadProfilesFromDB();
   if (Object.keys(profiles).length === 0) {
     showCreateView();
   } else {
-    showSignInView();
+    showSignInView(profiles);
   }
   document.getElementById('auth-modal').classList.remove('hidden');
 }
 
-function showSignInView() {
+function showSignInView(profiles) {
+  if (!profiles) profiles = loadProfilesLocal();
   document.getElementById('signin-view').classList.remove('hidden');
   document.getElementById('create-view').classList.add('hidden');
   document.getElementById('auth-error').textContent = '';
   document.getElementById('signin-name').value = '';
   document.getElementById('signin-pin').value = '';
 
-  const profiles = loadProfiles();
   const list = document.getElementById('user-list');
   list.innerHTML = '';
   Object.values(profiles).forEach(p => {
@@ -81,7 +109,7 @@ function showCreateView() {
   setTimeout(() => document.getElementById('create-name').focus(), 50);
 }
 
-function signIn() {
+async function signIn() {
   const name = document.getElementById('signin-name').value.trim();
   const pin  = document.getElementById('signin-pin').value.trim();
   const err  = document.getElementById('auth-error');
@@ -89,7 +117,7 @@ function signIn() {
   if (!name) { err.textContent = 'Please enter your name.'; return; }
   if (!pin)  { err.textContent = 'Please enter your PIN.'; return; }
 
-  const profiles = loadProfiles();
+  const profiles = await loadProfilesFromDB();
   const key = nameToKey(name);
   const profile = profiles[key];
 
@@ -105,7 +133,7 @@ function signIn() {
   renderStats();
 }
 
-function createAccount() {
+async function createAccount() {
   const name = document.getElementById('create-name').value.trim();
   const pin  = document.getElementById('create-pin').value.trim();
   const pin2 = document.getElementById('create-pin2').value.trim();
@@ -115,22 +143,22 @@ function createAccount() {
   if (!/^\d{4}$/.test(pin)) { err.textContent = 'PIN must be exactly 4 digits.'; return; }
   if (pin !== pin2) { err.textContent = 'PINs do not match.'; return; }
 
-  const profiles = loadProfiles();
+  const profiles = await loadProfilesFromDB();
   const key = nameToKey(name);
   if (profiles[key]) { err.textContent = 'That name is taken. Choose another.'; return; }
 
   const cats = ['Patient Care','Safety','Image Production','Procedures'];
-  profiles[key] = {
+  const newProfile = {
     name, pin,
     totalAnswered: 0, totalCorrect: 0, score: 0, bestStreak: 0,
     catStats: Object.fromEntries(cats.map(c => [c, { answered:0, correct:0 }])),
     savedAt: null
   };
-  saveProfiles(profiles);
+  await saveProfileToDB(key, newProfile);
 
   currentUser = key;
   localStorage.setItem(CURRENT_KEY, key);
-  loadUserStats(profiles[key]);
+  loadUserStats(newProfile);
   document.getElementById('auth-modal').classList.add('hidden');
   document.getElementById('header-name-text').textContent = '👤 ' + name;
   document.getElementById('signout-btn').style.display = '';
@@ -201,15 +229,18 @@ function elapsedLabel() {
 // ================================================================
 function saveStats() {
   if (!currentUser) return;
-  const profiles = loadProfiles();
+  const profiles = loadProfilesLocal();
   if (!profiles[currentUser]) return;
-  Object.assign(profiles[currentUser], {
+  const updated = Object.assign({}, profiles[currentUser], {
     totalAnswered, totalCorrect, score,
     bestStreak: Math.max(bestStreak, streak),
     catStats,
     savedAt: new Date().toLocaleDateString()
   });
-  saveProfiles(profiles);
+  // Save locally immediately (fast), then async to Firestore
+  profiles[currentUser] = updated;
+  saveProfilesLocal(profiles);
+  saveProfileToDB(currentUser, updated);
 }
 
 function resetSaved() {
@@ -227,28 +258,40 @@ function resetSaved() {
 // ================================================================
 //  INIT
 // ================================================================
-function init() {
+async function init() {
   ['Patient Care','Safety','Image Production','Procedures'].forEach(c => {
     catStats[c] = { answered:0, correct:0 };
   });
 
+  filterQuestions();
+  renderFlashcard();
+
   const savedKey = localStorage.getItem(CURRENT_KEY);
   if (savedKey) {
-    const profiles = loadProfiles();
-    if (profiles[savedKey]) {
+    // Load from local cache first for speed, then sync from Firestore
+    const localProfiles = loadProfilesLocal();
+    if (localProfiles[savedKey]) {
       currentUser = savedKey;
-      loadUserStats(profiles[savedKey]);
-      document.getElementById('header-name-text').textContent = '👤 ' + profiles[savedKey].name;
+      loadUserStats(localProfiles[savedKey]);
+      document.getElementById('header-name-text').textContent = '👤 ' + localProfiles[savedKey].name;
       document.getElementById('signout-btn').style.display = '';
-    } else {
+      renderStats();
+    }
+    // Now fetch latest from Firestore in background
+    const dbProfiles = await loadProfilesFromDB();
+    if (dbProfiles[savedKey]) {
+      currentUser = savedKey;
+      loadUserStats(dbProfiles[savedKey]);
+      document.getElementById('header-name-text').textContent = '👤 ' + dbProfiles[savedKey].name;
+      document.getElementById('signout-btn').style.display = '';
+      renderStats();
+    } else if (!localProfiles[savedKey]) {
       showAuthModal();
     }
   } else {
     showAuthModal();
   }
 
-  filterQuestions();
-  renderFlashcard();
   renderStats();
 }
 
@@ -537,7 +580,7 @@ function renderStats() {
     </div>`;
   }).join('');
 
-  const profile = currentUser ? loadProfiles()[currentUser] : null;
+  const profile = currentUser ? loadProfilesLocal()[currentUser] : null;
   const since = profile && profile.savedAt ? `<div style="color:var(--rose);margin-top:6px;font-size:0.8rem">Last saved: ${profile.savedAt}</div>` : '';
   document.getElementById('session-stats').innerHTML = `
     <div>Studying as: <strong>${profile ? profile.name : '—'}</strong></div>
